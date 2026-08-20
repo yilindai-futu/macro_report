@@ -1,0 +1,16 @@
+---
+description: 大模型调用必须走共用执行层；业务侧只拼客户问题
+globs: app/scripts/**/*.py,app/services/prompt_test_runner.py,app/api/v1/**/*.py,docs/**/*.md
+alwaysApply: false
+---
+
+# 大模型调用规范
+
+权威文档：`docs/llm-call-convention.md`；总览见 `AGENTS.md`。
+
+## 强制
+
+1. 业务脚本 / 业务 API：**只**做校验、拼装客户问题、选用已发布 `prompt_bundle` + `llm_configs`、调用 `run_prompt_bundle_with_skills`（或后续同一共用入口）、回写业务结果。
+2. **禁止**在业务脚本内自建多 Agent（Reader/Merger/Auditor）、自建 tool 循环、或绕过 `llm_configs` 直连模型厂商。
+3. 多 Agent / 原文可溯源 / Skills tools：只在提示词工作台与 `services/prompt_test_runner.py` 演进；生产与试运行共用语义。
+4. 修改大模型相关行为时，同步更新 `docs/llm-call-convention.md` 与对应业务文档（如 `docs/<script>.md`）。

@@ -1,0 +1,30 @@
+---
+description: macro-report 提交与推送分支规则（禁止误推 staging/prod）
+alwaysApply: true
+---
+
+# 提交 / 推送规则
+
+用户说「提交」「推送」「提交推送」时，默认目标是 **`dev` 分支**，不要推到 `staging` / `main` / `prod`。
+
+## 分支流向（强制）
+
+| 动作 | 正确做法 |
+|---|---|
+| 日常功能提交并推送 | checkout **`dev`** → commit → `git push origin dev` |
+| 上 staging | **禁止**直接 push；走 PR：`main` → `staging` |
+| 上 prod | **禁止**直接 push；走 PR：`staging` → `prod` |
+
+- `push` 到 `dev` → `deploy-dev.yml` 自动部署开发环境
+- `staging` 只接受来自 `main` 的 PR（见 `validate-pr-source.yml`）
+- 推送前必须确认：`git branch --show-current` 为 `dev`；若在别的分支，先切到 `dev` 再提交推送
+
+## 迁移编号
+
+推到 `dev` 前核对 `app/migrations/` 最新编号，避免与远端 `dev` 已有迁移撞号（例如已有 `000003_*` 时新文件用 `000004_*`）。
+
+## 禁止
+
+- 在 `staging` 上直接 commit + push 功能改动
+- 未确认当前分支就 `git push -u origin HEAD`
+- 为「修好误推」而对 `staging`/`main` 做 force push（除非用户明确要求）
