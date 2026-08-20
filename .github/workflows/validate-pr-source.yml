@@ -1,0 +1,27 @@
+name: validate-pr-source
+
+on:
+  pull_request:
+    branches: [staging, prod]
+
+jobs:
+  check-source:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate source branch
+        run: |
+          TARGET="${{ github.base_ref }}"
+          SOURCE="${{ github.head_ref }}"
+          echo "PR: $SOURCE → $TARGET"
+
+          if [ "$TARGET" = "staging" ] && [ "$SOURCE" != "main" ]; then
+            echo "❌ staging 只接受来自 main 的 PR（实际来源：$SOURCE）"
+            exit 1
+          fi
+
+          if [ "$TARGET" = "prod" ] && [ "$SOURCE" != "staging" ]; then
+            echo "❌ prod 只接受来自 staging 的 PR（实际来源：$SOURCE）"
+            exit 1
+          fi
+
+          echo "✅ 来源分支 $SOURCE 合法"

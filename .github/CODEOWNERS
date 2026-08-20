@@ -1,0 +1,7 @@
+# 关键路径保护：以下路径的 PR 必须由指定人审批后方可合并
+
+AGENTS.md                @linusli-balance @holiyliu-futu
+CLAUDE.md                @linusli-balance @holiyliu-futu
+.gitignore               @linusli-balance @holiyliu-futu
+/iac/                    @linusli-balance @holiyliu-futu
+/.github/workflows/      @linusli-balance @holiyliu-futu

@@ -1,0 +1,31 @@
+name: ci
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  check-api-docs:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Check docs/api.md updated when api changes
+        if: github.event_name == 'pull_request'
+        run: |
+          BASE="${{ github.event.pull_request.base.sha }}"
+          HEAD="${{ github.event.pull_request.head.sha }}"
+          CHANGED=$(git diff --name-only "$BASE" "$HEAD")
+          echo "Changed files:"
+          echo "$CHANGED"
+
+          API_CHANGED=$(echo "$CHANGED" | grep -qE '^app/(api/v1/|models/schemas\.py)' && echo true || echo false)
+          DOC_CHANGED=$(echo "$CHANGED" | grep -qE '^docs/api\.md' && echo true || echo false)
+
+          if [ "$API_CHANGED" = "true" ] && [ "$DOC_CHANGED" = "false" ]; then
+            echo "::error file=docs/api.md::app/api/v1/ 或 models/schemas.py 有变动，但 docs/api.md 未同步更新。请更新 API 文档后重新提交。"
+            exit 1
+          fi
+          echo "✅ API 文档检查通过"

@@ -1,0 +1,70 @@
+name: sync-dev-to-main
+
+on:
+  workflow_run:
+    workflows: ["deploy-dev"]
+    types: [completed]
+    branches: [dev]
+  push:
+    branches: [dev]
+    paths-ignore:
+      - 'app/**'
+      - 'iac/**'
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    if: |
+      github.event_name == 'push' ||
+      (github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success')
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Resolve target SHA
+        id: sha
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_run" ]; then
+            echo "value=${{ github.event.workflow_run.head_sha }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "value=${{ github.sha }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Merge dev → main
+        run: |
+          TARGET="${{ steps.sha.outputs.value }}"
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git fetch origin
+          git checkout main
+
+          if git merge-base --is-ancestor "${TARGET}" HEAD; then
+            echo "main already contains ${TARGET}, nothing to do"
+            exit 0
+          fi
+
+          if ! git merge "${TARGET}" --ff-only; then
+            echo "❌ Fast-forward failed: main 与 dev 已分叉"
+            exit 1
+          fi
+
+          for i in 1 2 3 4 5; do
+            if git push origin main; then
+              echo "✅ main fast-forwarded to ${TARGET}"
+              exit 0
+            fi
+            echo "⚠️ push 被拒，重试 $i/5，10s 后..."
+            sleep 10
+            git fetch origin
+            git reset --hard origin/main
+            if ! git merge "${TARGET}" --ff-only; then
+              echo "❌ 重试时 ff 失败"
+              exit 1
+            fi
+          done
+          echo "❌ 推送重试 5 次仍失败"
+          exit 1

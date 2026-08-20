@@ -1,0 +1,87 @@
+name: ecs-service-control
+
+run-name: "${{ inputs.action }} ECS service -> ${{ inputs.environment }} (${{ github.actor }})"
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Target environment"
+        required: true
+        type: choice
+        options:
+          - dev
+          - staging
+          - prod
+      action:
+        description: "Service action"
+        required: true
+        type: choice
+        options:
+          - start
+          - stop
+      desired_count:
+        description: "Desired count for start; ignored when action=stop"
+        required: false
+        default: "1"
+        type: string
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  control:
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment == 'prod' && 'production-app' || inputs.environment == 'dev' && 'development' || 'staging' }}
+    env:
+      AWS_REGION: ${{ vars.AWS_REGION || 'ap-east-1' }}
+      AWS_ACCOUNT_ID: ${{ vars.AWS_ACCOUNT_ID }}
+    steps:
+      - name: Resolve target
+        id: target
+        run: |
+          case "${{ inputs.environment }}" in
+            dev)     echo "env_pascal=Development" >> "$GITHUB_OUTPUT" ;;
+            staging) echo "env_pascal=Staging"     >> "$GITHUB_OUTPUT" ;;
+            prod)    echo "env_pascal=Production"  >> "$GITHUB_OUTPUT" ;;
+            *)       echo "Unsupported environment" >&2; exit 1 ;;
+          esac
+          if [ "${{ inputs.action }}" = "stop" ]; then
+            echo "desired_count=0" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if ! [[ "${{ inputs.desired_count }}" =~ ^[1-9][0-9]*$ ]]; then
+            echo "desired_count must be a positive integer" >&2
+            exit 1
+          fi
+          echo "desired_count=${{ inputs.desired_count }}" >> "$GITHUB_OUTPUT"
+
+      - name: Configure AWS via OIDC
+        uses: aws-actions/configure-aws-credentials@v6.1.3
+        with:
+          role-to-assume: arn:aws:iam::${{ env.AWS_ACCOUNT_ID }}:role/AppDeployRole-MacroReport-${{ steps.target.outputs.env_pascal }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: macro-report-service-control-${{ inputs.environment }}-gha
+
+      - name: Update ECS desired count
+        run: |
+          CLUSTER="macro-report-${{ inputs.environment }}"
+          aws ecs update-service \
+            --cluster "${CLUSTER}" --service "${CLUSTER}" \
+            --desired-count "${{ steps.target.outputs.desired_count }}" \
+            --region "${AWS_REGION}"
+
+      - name: Wait for ECS service stable
+        run: |
+          CLUSTER="macro-report-${{ inputs.environment }}"
+          aws ecs wait services-stable \
+            --cluster "${CLUSTER}" --services "${CLUSTER}" --region "${AWS_REGION}"
+
+      - name: Show ECS service status
+        run: |
+          CLUSTER="macro-report-${{ inputs.environment }}"
+          aws ecs describe-services \
+            --cluster "${CLUSTER}" --services "${CLUSTER}" --region "${AWS_REGION}" \
+            --query 'services[0].{serviceName:serviceName,status:status,desiredCount:desiredCount,runningCount:runningCount}' \
+            --output table

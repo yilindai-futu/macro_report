@@ -1,0 +1,217 @@
+# dev 环境部署。
+# 检测本次推送是否涉及 app/、iac/ 或 dev-server/iac/；
+# 应用变动顺序：deploy-app（IaC）→ migrate（并行）→ force-deploy。
+name: deploy-dev
+
+run-name: "deploy-dev (${{ github.actor }})"
+
+on:
+  push:
+    branches:
+      - dev
+    paths:
+      - 'app/**'
+      - 'iac/**'
+      - 'dev-server/iac/**'
+      - '.github/workflows/deploy-dev.yml'
+      - '.github/workflows/_deploy-app.yml'
+      - '.github/workflows/_db-migrate.yml'
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      app: ${{ steps.detect.outputs.app }}
+      dev-server: ${{ steps.detect.outputs.dev-server }}
+      db-migration: ${{ steps.detect.outputs.db-migration }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Detect changed paths
+        id: detect
+        run: |
+          BEFORE="${{ github.event.before }}"
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "app=true"               >> "$GITHUB_OUTPUT"
+            echo "dev-server=false"       >> "$GITHUB_OUTPUT"
+            echo "db-migration=true"      >> "$GITHUB_OUTPUT"
+          elif [ -z "$BEFORE" ] || [ "$BEFORE" = "0000000000000000000000000000000000000000" ]; then
+            echo "app=true"          >> "$GITHUB_OUTPUT"
+            echo "dev-server=true"   >> "$GITHUB_OUTPUT"
+            echo "db-migration=true" >> "$GITHUB_OUTPUT"
+          else
+            git diff --name-only "$BEFORE" "${{ github.sha }}" > /tmp/changed.txt
+            cat /tmp/changed.txt
+            echo "app=$(grep -qE '^(app|iac)/' /tmp/changed.txt && echo true || echo false)"            >> "$GITHUB_OUTPUT"
+            echo "dev-server=$(grep -qE '^dev-server/iac/' /tmp/changed.txt && echo true || echo false)" >> "$GITHUB_OUTPUT"
+            echo "db-migration=$(grep -qE '^app/(migrations/|init_db\.py)' /tmp/changed.txt && echo true || echo false)" >> "$GITHUB_OUTPUT"
+          fi
+
+  deploy-app:
+    needs: changes
+    if: needs.changes.outputs.app == 'true'
+    uses: ./.github/workflows/_deploy-app.yml
+    with:
+      working_directory: iac
+      docker_context: app
+      ecr_repository: app-macro-report
+      env: dev
+      env_pascal: Development
+      gh_environment: development
+      skip_force_deploy: true
+    secrets: inherit
+
+  migrate-db:
+    needs: [changes, deploy-app]
+    if: |
+      always() &&
+      needs.deploy-app.result == 'success' &&
+      needs.changes.outputs.db-migration == 'true'
+    uses: ./.github/workflows/_db-migrate.yml
+    with:
+      env: dev
+      env_pascal: Development
+      gh_environment: development
+      ecr_repository: app-macro-report
+    secrets: inherit
+
+  force-deploy:
+    needs: [changes, deploy-app, migrate-db]
+    if: |
+      always() &&
+      needs.deploy-app.result == 'success' &&
+      (needs.migrate-db.result == 'success' || needs.migrate-db.result == 'skipped')
+    runs-on: ubuntu-latest
+    environment: development
+    env:
+      AWS_REGION: ${{ vars.AWS_REGION || 'ap-east-1' }}
+      AWS_ACCOUNT_ID: ${{ vars.AWS_ACCOUNT_ID }}
+      DESIRED_TAG: ${{ needs.deploy-app.outputs.image_tag }}
+      IMAGE_IS_NEW: ${{ needs.deploy-app.outputs.image_is_new }}
+    steps:
+      - name: Configure AWS via OIDC
+        uses: aws-actions/configure-aws-credentials@v6.1.3
+        with:
+          role-to-assume: arn:aws:iam::${{ env.AWS_ACCOUNT_ID }}:role/AppDeployRole-MacroReport-Development
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: macro-report-force-deploy-dev-gha
+
+      - name: Force new ECS deployment if needed
+        id: roll
+        run: |
+          set -euo pipefail
+          CLUSTER="macro-report-dev"
+          DESIRED="${DESIRED_TAG}"
+          if [ -z "${DESIRED}" ]; then
+            echo "Missing desired image tag from deploy-app" >&2
+            exit 1
+          fi
+
+          RESULT=$(aws ecs describe-services \
+            --cluster "$CLUSTER" --services "$CLUSTER" --region "$AWS_REGION" \
+            --query '[length(services[0].deployments), services[0].deployments[0].rolloutState, services[0].taskDefinition]' \
+            --output text)
+          NDEPLOYS=$(echo "$RESULT" | awk '{print $1}')
+          STATE=$(echo "$RESULT" | awk '{print $2}')
+          TD=$(echo "$RESULT" | awk '{print $3}')
+          CURRENT_IMAGE=$(aws ecs describe-task-definition \
+            --task-definition "$TD" --region "$AWS_REGION" \
+            --query 'taskDefinition.containerDefinitions[0].image' --output text)
+
+          TD_ON_DESIRED=false
+          case "${CURRENT_IMAGE}" in
+            *":${DESIRED}") TD_ON_DESIRED=true ;;
+          esac
+
+          RUNNING_ON_DESIRED=false
+          mapfile -t TASK_ARNS < <(
+            aws ecs list-tasks --cluster "$CLUSTER" --service-name "$CLUSTER" \
+              --desired-status RUNNING --region "$AWS_REGION" \
+              --query 'taskArns[]' --output text | tr '\t' '\n' | awk 'NF'
+          )
+          if [ "${#TASK_ARNS[@]}" -gt 0 ]; then
+            RUNNING_ON_DESIRED=true
+            while IFS= read -r img; do
+              [ -z "$img" ] && continue
+              case "$img" in
+                *":${DESIRED}") ;;
+                *) RUNNING_ON_DESIRED=false ;;
+              esac
+            done < <(
+              aws ecs describe-tasks --cluster "$CLUSTER" --tasks "${TASK_ARNS[@]}" \
+                --region "$AWS_REGION" \
+                --query 'tasks[].containers[0].image' --output text | tr '\t' '\n'
+            )
+          fi
+
+          if [ "$RUNNING_ON_DESIRED" = "true" ] && [ "$NDEPLOYS" = "1" ] && [ "$STATE" = "COMPLETED" ]; then
+            echo "skip_wait=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [ "$TD_ON_DESIRED" = "true" ] && { [ "$NDEPLOYS" != "1" ] || [ "$STATE" != "COMPLETED" ]; }; then
+            echo "skip_wait=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          aws ecs update-service \
+            --cluster "${CLUSTER}" \
+            --service "${CLUSTER}" \
+            --force-new-deployment \
+            --region "${AWS_REGION}"
+          echo "skip_wait=false" >> "$GITHUB_OUTPUT"
+
+      - name: Wait for ECS service stable
+        if: steps.roll.outputs.skip_wait != 'true'
+        run: |
+          CLUSTER="macro-report-dev"
+          aws ecs wait services-stable \
+            --cluster "${CLUSTER}" \
+            --services "${CLUSTER}" \
+            --region "${AWS_REGION}"
+
+  deploy-dev-server:
+    needs: changes
+    if: needs.changes.outputs.dev-server == 'true'
+    runs-on: ubuntu-latest
+    environment: development
+    env:
+      AWS_REGION: ${{ vars.AWS_REGION || 'ap-east-1' }}
+      AWS_ACCOUNT_ID: ${{ vars.AWS_ACCOUNT_ID }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: opentofu/setup-opentofu@v2
+        with:
+          tofu_version: "1.6.2"
+
+      - uses: aws-actions/configure-aws-credentials@v6.1.3
+        with:
+          role-to-assume: arn:aws:iam::${{ env.AWS_ACCOUNT_ID }}:role/AppDeployRole-MacroReport-Development
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: macro-report-dev-server-gha
+
+      - name: Write backend config
+        run: |
+          cat > dev-server/iac/backend.dev.hcl <<EOF
+          bucket                = "balance-tf-state-dev-ap-east-1"
+          key                   = "app/macro-report/dev-server/dev/terraform.tfstate"
+          region                = "ap-east-1"
+          dynamodb_table        = "balance-tf-locks-dev-ap-east-1"
+          encrypt               = true
+          workspace_key_prefix  = "app/macro-report/dev-server/dev/workspaces"
+          EOF
+
+      - name: Tofu init, plan and apply
+        working-directory: dev-server/iac
+        run: |
+          tofu init -backend-config=backend.dev.hcl
+          tofu plan -input=false -out=tfplan -var="env=dev" -var="region=${AWS_REGION}"
+          tofu apply -input=false -auto-approve tfplan

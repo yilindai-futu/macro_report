@@ -1,0 +1,240 @@
+# macro-report 数据库迁移：Build image → one-shot ECS task。
+# 建库 macro_report（若不存在）并执行 app/migrations/*.sql。
+name: _db-migrate
+
+on:
+  workflow_call:
+    inputs:
+      env:
+        required: true
+        type: string
+      env_pascal:
+        required: true
+        type: string
+      gh_environment:
+        required: true
+        type: string
+      ecr_repository:
+        required: true
+        type: string
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  migrate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    environment: ${{ inputs.gh_environment }}
+    env:
+      AWS_REGION: ${{ vars.AWS_REGION || 'ap-east-1' }}
+      AWS_ACCOUNT_ID: ${{ vars.AWS_ACCOUNT_ID }}
+      CLUSTER: macro-report-${{ inputs.env }}
+      PG_USER: app_iam
+      PG_DBNAME: macro_report
+      DB_MAINTENANCE_NAME: meerkat
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Configure AWS via OIDC
+        id: aws_oidc
+        continue-on-error: true
+        uses: aws-actions/configure-aws-credentials@v6.1.3
+        with:
+          role-to-assume: arn:aws:iam::${{ env.AWS_ACCOUNT_ID }}:role/AppDeployRole-MacroReport-${{ inputs.env_pascal }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: macro-report-db-migrate-${{ inputs.env }}-gha
+          action-timeout-s: 120
+
+      - name: Configure AWS via OIDC (retry)
+        if: steps.aws_oidc.outcome == 'failure'
+        uses: aws-actions/configure-aws-credentials@v6.1.3
+        with:
+          role-to-assume: arn:aws:iam::${{ env.AWS_ACCOUNT_ID }}:role/AppDeployRole-MacroReport-${{ inputs.env_pascal }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: macro-report-db-migrate-${{ inputs.env }}-gha-retry
+          action-timeout-s: 120
+
+      - name: Get ECR registry URL
+        id: ecr_ssm
+        run: |
+          REGISTRY=$(aws ssm get-parameter \
+            --name "/infra/bl/${{ inputs.env }}/ap-east-1/ecr/registry-url" \
+            --query 'Parameter.Value' --output text)
+          echo "registry=${REGISTRY}" >> "$GITHUB_OUTPUT"
+
+      - name: Login to ECR
+        run: |
+          aws ecr get-login-password --region "${AWS_REGION}" | \
+            docker login --username AWS --password-stdin "${{ steps.ecr_ssm.outputs.registry }}"
+
+      - name: Compute image tag
+        id: tag
+        run: |
+          CONTENT_SHA=$(git ls-tree -r HEAD "app/" | sha1sum | cut -c1-40)
+          echo "value=macro-report-${CONTENT_SHA}" >> "$GITHUB_OUTPUT"
+
+      - name: Check if image already exists in ECR
+        id: ecr_check
+        run: |
+          IMAGE="${{ steps.ecr_ssm.outputs.registry }}/${{ inputs.ecr_repository }}:${{ steps.tag.outputs.value }}"
+          if docker manifest inspect "${IMAGE}" 2>/dev/null; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Set up Docker Buildx
+        if: steps.ecr_check.outputs.exists != 'true'
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push image
+        if: steps.ecr_check.outputs.exists != 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: app
+          push: true
+          tags: ${{ steps.ecr_ssm.outputs.registry }}/${{ inputs.ecr_repository }}:${{ steps.tag.outputs.value }}
+          cache-from: type=gha,scope=macro-report-${{ inputs.env }}
+          cache-to: type=gha,mode=max,scope=macro-report-${{ inputs.env }}
+
+      - name: Resolve network and database parameters
+        id: params
+        run: |
+          set -euo pipefail
+          SSM_SHARED="/app/meerkat/${{ inputs.env }}/shared"
+          VPC_ID=$(aws ssm get-parameter --name "/infra/bl/${{ inputs.env }}/ap-east-1/network/vpc-id" --query Parameter.Value --output text)
+          SUBNET_IDS=$(aws ssm get-parameter --name "/infra/bl/${{ inputs.env }}/ap-east-1/network/subnet-ids/priv" --query Parameter.Value --output text)
+          DB_HOST=$(aws ssm get-parameter --name "${SSM_SHARED}/postgres-endpoint" --query Parameter.Value --output text)
+          DB_PORT=$(aws ssm get-parameter --name "${SSM_SHARED}/postgres-port" --query Parameter.Value --output text)
+          PG_SG=$(aws ssm get-parameter --name "${SSM_SHARED}/postgres-sg-id" --query Parameter.Value --output text)
+          SERVICE_SG=$(aws ec2 describe-security-groups \
+            --filters "Name=vpc-id,Values=${VPC_ID}" "Name=group-name,Values=${CLUSTER}-svc" \
+            --query "SecurityGroups[0].GroupId" --output text)
+
+          if [ -z "$SERVICE_SG" ] || [ "$SERVICE_SG" = "None" ]; then
+            echo "Unable to resolve ${CLUSTER}-svc security group. Run the macro-report IaC deployment once before enabling DB migrations."
+            exit 1
+          fi
+
+          echo "subnet_ids=${SUBNET_IDS}" >> "$GITHUB_OUTPUT"
+          echo "security_groups=${SERVICE_SG},${PG_SG}" >> "$GITHUB_OUTPUT"
+          echo "db_host=${DB_HOST}" >> "$GITHUB_OUTPUT"
+          echo "db_port=${DB_PORT}" >> "$GITHUB_OUTPUT"
+
+      - name: Register migration task definition
+        id: taskdef
+        run: |
+          set -euo pipefail
+          IMAGE="${{ steps.ecr_ssm.outputs.registry }}/${{ inputs.ecr_repository }}:${{ steps.tag.outputs.value }}"
+          EXEC_ROLE="arn:aws:iam::${AWS_ACCOUNT_ID}:role/${CLUSTER}-exec"
+          TASK_ROLE="arn:aws:iam::${AWS_ACCOUNT_ID}:role/${CLUSTER}-task"
+
+          cat > /tmp/taskdef.json <<EOF
+          {
+            "family": "${CLUSTER}-db-migrate",
+            "requiresCompatibilities": ["FARGATE"],
+            "networkMode": "awsvpc",
+            "cpu": "256",
+            "memory": "512",
+            "executionRoleArn": "${EXEC_ROLE}",
+            "taskRoleArn": "${TASK_ROLE}",
+            "containerDefinitions": [
+              {
+                "name": "macro-report-db-migrate",
+                "image": "${IMAGE}",
+                "essential": true,
+                "entryPoint": ["python", "init_db.py"],
+                "environment": [
+                  { "name": "PG_HOST", "value": "${{ steps.params.outputs.db_host }}" },
+                  { "name": "PG_PORT", "value": "${{ steps.params.outputs.db_port }}" },
+                  { "name": "PG_USER", "value": "${PG_USER}" },
+                  { "name": "PG_REGION", "value": "${AWS_REGION}" },
+                  { "name": "PG_SSLMODE", "value": "require" },
+                  { "name": "PG_DBNAME", "value": "${PG_DBNAME}" },
+                  { "name": "MACRO_REPORT_DB_NAME", "value": "${PG_DBNAME}" },
+                  { "name": "DB_MAINTENANCE_NAME", "value": "${DB_MAINTENANCE_NAME}" }
+                ],
+                "logConfiguration": {
+                  "logDriver": "awslogs",
+                  "options": {
+                    "awslogs-group": "/ecs/${CLUSTER}",
+                    "awslogs-region": "${AWS_REGION}",
+                    "awslogs-stream-prefix": "db-migrate"
+                  }
+                }
+              }
+            ]
+          }
+          EOF
+
+          TASK_DEF_ARN=$(aws ecs register-task-definition \
+            --cli-input-json file:///tmp/taskdef.json \
+            --query "taskDefinition.taskDefinitionArn" \
+            --output text)
+          echo "arn=${TASK_DEF_ARN}" >> "$GITHUB_OUTPUT"
+
+      - name: Check pending migrations
+        id: pending_check
+        run: |
+          set -euo pipefail
+          TASK_ARN=$(aws ecs run-task \
+            --cluster "${CLUSTER}" \
+            --task-definition "${{ steps.taskdef.outputs.arn }}" \
+            --launch-type FARGATE \
+            --network-configuration "awsvpcConfiguration={subnets=[${{ steps.params.outputs.subnet_ids }}],securityGroups=[${{ steps.params.outputs.security_groups }}],assignPublicIp=DISABLED}" \
+            --overrides '{"containerOverrides":[{"name":"macro-report-db-migrate","command":["--check"]}]}' \
+            --query "tasks[0].taskArn" \
+            --output text)
+
+          if [ -z "$TASK_ARN" ] || [ "$TASK_ARN" = "None" ]; then
+            echo "Failed to start check task"
+            exit 1
+          fi
+
+          aws ecs wait tasks-stopped --cluster "${CLUSTER}" --tasks "${TASK_ARN}"
+          EXIT_CODE=$(aws ecs describe-tasks \
+            --cluster "${CLUSTER}" \
+            --tasks "${TASK_ARN}" \
+            --query "tasks[0].containers[0].exitCode" \
+            --output text)
+
+          if [ "$EXIT_CODE" = "0" ]; then
+            echo "has_pending=false" >> "$GITHUB_OUTPUT"
+          elif [ "$EXIT_CODE" = "2" ]; then
+            echo "has_pending=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "Migration check failed with exit code ${EXIT_CODE}; check CloudWatch /ecs/${CLUSTER}"
+            exit 1
+          fi
+
+      - name: Run migration task
+        if: steps.pending_check.outputs.has_pending == 'true'
+        run: |
+          set -euo pipefail
+          TASK_ARN=$(aws ecs run-task \
+            --cluster "${CLUSTER}" \
+            --task-definition "${{ steps.taskdef.outputs.arn }}" \
+            --launch-type FARGATE \
+            --network-configuration "awsvpcConfiguration={subnets=[${{ steps.params.outputs.subnet_ids }}],securityGroups=[${{ steps.params.outputs.security_groups }}],assignPublicIp=DISABLED}" \
+            --query "tasks[0].taskArn" \
+            --output text)
+
+          if [ -z "$TASK_ARN" ] || [ "$TASK_ARN" = "None" ]; then
+            echo "Failed to start migration task"
+            exit 1
+          fi
+
+          aws ecs wait tasks-stopped --cluster "${CLUSTER}" --tasks "${TASK_ARN}"
+          EXIT_CODE=$(aws ecs describe-tasks \
+            --cluster "${CLUSTER}" \
+            --tasks "${TASK_ARN}" \
+            --query "tasks[0].containers[0].exitCode" \
+            --output text)
+
+          if [ "$EXIT_CODE" != "0" ]; then
+            echo "DB migration failed with exit code ${EXIT_CODE}; check CloudWatch /ecs/${CLUSTER}"
+            exit 1
+          fi
+          echo "DB migration completed"

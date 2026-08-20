@@ -1,0 +1,238 @@
+# 可复用 ECS 单环境部署：Docker build → ECR push → Tofu apply → ECS force-new-deployment
+name: _deploy-app
+
+on:
+  workflow_call:
+    inputs:
+      working_directory:
+        description: "IaC 目录，如 iac"
+        required: true
+        type: string
+      docker_context:
+        description: "Dockerfile 所在目录，如 app"
+        required: true
+        type: string
+      ecr_repository:
+        description: "集中 ECR 仓库名，如 app-macro-report"
+        required: true
+        type: string
+      env:
+        required: true
+        type: string
+      env_pascal:
+        required: true
+        type: string
+      gh_environment:
+        required: true
+        type: string
+      skip_force_deploy:
+        description: "跳过 force-new-deployment（staging/prod 由外层 deploy.yml 在 migrate-db 后统一处理）"
+        required: false
+        type: boolean
+        default: false
+    outputs:
+      image_is_new:
+        description: "本次是否推送了新镜像"
+        value: ${{ jobs.deploy.outputs.image_is_new }}
+      image_tag:
+        description: "本次部署使用的镜像 tag（app/ content hash）"
+        value: ${{ jobs.deploy.outputs.image_tag }}
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.gh_environment }}
+    outputs:
+      image_is_new: ${{ steps.ecr_check.outputs.exists != 'true' }}
+      image_tag: ${{ steps.tag.outputs.value }}
+    env:
+      AWS_REGION: ${{ vars.AWS_REGION || 'ap-east-1' }}
+      AWS_ACCOUNT_ID: ${{ vars.AWS_ACCOUNT_ID }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Configure AWS via OIDC
+        uses: aws-actions/configure-aws-credentials@v6.1.3
+        with:
+          role-to-assume: arn:aws:iam::${{ env.AWS_ACCOUNT_ID }}:role/AppDeployRole-MacroReport-${{ inputs.env_pascal }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: macro-report-${{ inputs.env }}-gha
+
+      - name: Ensure supplemental role permissions
+        run: |
+          aws iam put-role-policy \
+            --role-name "AppDeployRole-MacroReport-${{ inputs.env_pascal }}" \
+            --policy-name "MacroReportSupplementalPermissions" \
+            --policy-document '{
+              "Version": "2012-10-17",
+              "Statement": [
+                {
+                  "Sid": "SsmWildcardActions",
+                  "Effect": "Allow",
+                  "Action": ["ssm:DescribeParameters","ssm:ListTagsForResource","ssm:RemoveTagsFromResource"],
+                  "Resource": "*"
+                },
+                {
+                  "Sid": "SecretsGetResourcePolicy",
+                  "Effect": "Allow",
+                  "Action": ["secretsmanager:GetResourcePolicy","secretsmanager:PutResourcePolicy","secretsmanager:DeleteResourcePolicy"],
+                  "Resource": "*"
+                },
+                {
+                  "Sid": "SecretsWriteValue",
+                  "Effect": "Allow",
+                  "Action": ["secretsmanager:PutSecretValue"],
+                  "Resource": "arn:aws:secretsmanager:*:*:secret:/app/macro-report/*"
+                },
+                {
+                  "Sid": "KmsForSecretsWrite",
+                  "Effect": "Allow",
+                  "Action": ["kms:GenerateDataKey","kms:Decrypt","kms:DescribeKey"],
+                  "Resource": "*",
+                  "Condition": {
+                    "StringEquals": {
+                      "kms:ViaService": "secretsmanager.ap-east-1.amazonaws.com"
+                    }
+                  }
+                },
+                {
+                  "Sid": "EcsServiceLinkedRole",
+                  "Effect": "Allow",
+                  "Action": ["iam:CreateServiceLinkedRole"],
+                  "Resource": "arn:aws:iam::*:role/aws-service-role/ecs.amazonaws.com/*"
+                },
+                {
+                  "Sid": "CloudWatchLogsStreamManage",
+                  "Effect": "Allow",
+                  "Action": ["logs:DescribeLogStreams","logs:DeleteLogStream"],
+                  "Resource": "arn:aws:logs:*:*:log-group:/ecs/macro-report-*:*"
+                },
+                {
+                  "Sid": "ScriptDispatcherInfrastructure",
+                  "Effect": "Allow",
+                  "Action": [
+                    "lambda:CreateFunction","lambda:UpdateFunctionCode","lambda:UpdateFunctionConfiguration",
+                    "lambda:GetFunction","lambda:GetFunctionConfiguration","lambda:DeleteFunction",
+                    "lambda:AddPermission","lambda:RemovePermission","lambda:ListTags","lambda:TagResource","lambda:UntagResource",
+                    "dynamodb:CreateTable","dynamodb:DescribeTable","dynamodb:UpdateTable","dynamodb:DeleteTable",
+                    "dynamodb:DescribeContinuousBackups","dynamodb:DescribeTimeToLive","dynamodb:UpdateTimeToLive",
+                    "dynamodb:ListTagsOfResource","dynamodb:TagResource","dynamodb:UntagResource"
+                  ],
+                  "Resource": "*"
+                }
+              ]
+            }'
+          sleep 5
+          aws iam create-service-linked-role --aws-service-name ecs.amazonaws.com 2>/dev/null || true
+
+      - name: Get ECR registry URL
+        id: ecr_ssm
+        run: |
+          REGISTRY=$(aws ssm get-parameter \
+            --name "/infra/bl/${{ inputs.env }}/ap-east-1/ecr/registry-url" \
+            --query 'Parameter.Value' --output text)
+          echo "registry=${REGISTRY}" >> "$GITHUB_OUTPUT"
+
+      - name: Login to ECR
+        run: |
+          aws ecr get-login-password --region "${AWS_REGION}" | \
+            docker login --username AWS --password-stdin "${{ steps.ecr_ssm.outputs.registry }}"
+
+      - name: Compute image tag
+        id: tag
+        run: |
+          CONTENT_SHA=$(git ls-tree -r HEAD "app/" | sha1sum | cut -c1-40)
+          echo "value=macro-report-${CONTENT_SHA}" >> "$GITHUB_OUTPUT"
+
+      - name: Check if image already exists in ECR
+        id: ecr_check
+        run: |
+          IMAGE="${{ steps.ecr_ssm.outputs.registry }}/${{ inputs.ecr_repository }}:${{ steps.tag.outputs.value }}"
+          if docker manifest inspect "${IMAGE}" 2>/dev/null; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Set up Docker Buildx
+        if: steps.ecr_check.outputs.exists != 'true'
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push image
+        if: steps.ecr_check.outputs.exists != 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ inputs.docker_context }}
+          push: true
+          tags: ${{ steps.ecr_ssm.outputs.registry }}/${{ inputs.ecr_repository }}:${{ steps.tag.outputs.value }}
+          cache-from: type=gha,scope=macro-report-${{ inputs.env }}
+          cache-to: type=gha,mode=max,scope=macro-report-${{ inputs.env }}
+
+      - uses: opentofu/setup-opentofu@v2
+        with:
+          tofu_version: "1.6.2"
+
+      - name: Resolve deploy role ARN
+        id: ssm
+        run: |
+          ROLE_ARN=$(aws ssm get-parameter \
+            --name "/infra/bl/${{ inputs.env }}/ap-east-1/platform/role-app-deploy-MacroReport-${{ inputs.env_pascal }}-arn" \
+            --query 'Parameter.Value' --output text --region "${AWS_REGION}" 2>/dev/null) \
+          || ROLE_ARN="arn:aws:iam::${AWS_ACCOUNT_ID}:role/AppDeployRole-MacroReport-${{ inputs.env_pascal }}"
+          echo "deploy_role_arn=${ROLE_ARN}" >> "$GITHUB_OUTPUT"
+
+      - name: Write backend config
+        run: |
+          cat > ${{ inputs.working_directory }}/backend.${{ inputs.env }}.hcl <<EOF
+          bucket                = "balance-tf-state-${{ inputs.env }}-ap-east-1"
+          key                   = "app/macro-report/${{ inputs.env }}/terraform.tfstate"
+          region                = "ap-east-1"
+          dynamodb_table        = "balance-tf-locks-${{ inputs.env }}-ap-east-1"
+          encrypt               = true
+          workspace_key_prefix  = "app/macro-report/${{ inputs.env }}/workspaces"
+          EOF
+
+      - name: Tofu init
+        working-directory: ${{ inputs.working_directory }}
+        run: tofu init -backend-config=backend.${{ inputs.env }}.hcl
+
+      - name: Tofu apply
+        working-directory: ${{ inputs.working_directory }}
+        run: |
+          tofu apply -input=false -auto-approve \
+            -var="env=${{ inputs.env }}" \
+            -var="region=${AWS_REGION}" \
+            -var="image_tag=${{ steps.tag.outputs.value }}"
+
+      - name: Force new ECS deployment
+        if: ${{ !inputs.skip_force_deploy && steps.ecr_check.outputs.exists != 'true' }}
+        run: |
+          CLUSTER="macro-report-${{ inputs.env }}"
+          aws ecs update-service \
+            --cluster "${CLUSTER}" \
+            --service "${CLUSTER}" \
+            --force-new-deployment \
+            --region "${AWS_REGION}"
+
+      - name: Wait for ECS service stable
+        if: ${{ !inputs.skip_force_deploy && steps.ecr_check.outputs.exists != 'true' }}
+        run: |
+          CLUSTER="macro-report-${{ inputs.env }}"
+          ATTEMPTS=0
+          MAX_ATTEMPTS=80
+          until aws ecs describe-services \
+                  --cluster "${CLUSTER}" --services "${CLUSTER}" \
+                  --region "${AWS_REGION}" \
+                  --query 'services[0].deployments | length(@) == `1` && services[0].deployments[0].rolloutState == `COMPLETED`' \
+                  --output text | grep -q "True"; do
+            ATTEMPTS=$((ATTEMPTS + 1))
+            if [ "${ATTEMPTS}" -ge "${MAX_ATTEMPTS}" ]; then
+              echo "ECS service did not stabilize after $((MAX_ATTEMPTS * 15))s"
+              exit 1
+            fi
+            sleep 15
+          done

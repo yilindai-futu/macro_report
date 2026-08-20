@@ -1,0 +1,71 @@
+name: dev-server
+
+run-name: "${{ inputs.action }} dev-server (${{ github.actor }})"
+
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: "操作"
+        required: true
+        type: choice
+        options:
+          - start
+          - stop
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  control:
+    runs-on: ubuntu-latest
+    environment: development
+    env:
+      AWS_REGION: ${{ vars.AWS_REGION || 'ap-east-1' }}
+      AWS_ACCOUNT_ID: ${{ vars.AWS_ACCOUNT_ID }}
+    steps:
+      - name: Configure AWS via OIDC
+        uses: aws-actions/configure-aws-credentials@v6.1.3
+        with:
+          role-to-assume: arn:aws:iam::${{ env.AWS_ACCOUNT_ID }}:role/AppDeployRole-MacroReport-Development
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: macro-report-dev-server-control-gha
+
+      - name: Resolve instance ID
+        id: instance
+        run: |
+          INSTANCE_ID=$(aws ec2 describe-instances \
+            --filters "Name=tag:Name,Values=macro-report-dev-server" \
+                      "Name=instance-state-name,Values=pending,running,stopping,stopped" \
+            --query "Reservations[0].Instances[0].InstanceId" \
+            --output text --region "${AWS_REGION}")
+          if [ -z "${INSTANCE_ID}" ] || [ "${INSTANCE_ID}" = "None" ]; then
+            echo "找不到实例 macro-report-dev-server" >&2
+            exit 1
+          fi
+          echo "instance_id=${INSTANCE_ID}" >> "$GITHUB_OUTPUT"
+
+      - name: Start instance
+        if: inputs.action == 'start'
+        run: |
+          aws ec2 start-instances \
+            --instance-ids "${{ steps.instance.outputs.instance_id }}" --region "${AWS_REGION}"
+
+      - name: Stop instance
+        if: inputs.action == 'stop'
+        run: |
+          aws ec2 stop-instances \
+            --instance-ids "${{ steps.instance.outputs.instance_id }}" --region "${AWS_REGION}"
+
+      - name: Wait for running
+        if: inputs.action == 'start'
+        run: |
+          aws ec2 wait instance-running \
+            --instance-ids "${{ steps.instance.outputs.instance_id }}" --region "${AWS_REGION}"
+
+      - name: Wait for stopped
+        if: inputs.action == 'stop'
+        run: |
+          aws ec2 wait instance-stopped \
+            --instance-ids "${{ steps.instance.outputs.instance_id }}" --region "${AWS_REGION}"

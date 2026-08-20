@@ -1,0 +1,142 @@
+# 暂停 EventBridge 调度并停止指定脚本的全部 RUNNING/PENDING jobs Task。
+name: stop-script
+
+run-name: "stop-script ${{ inputs.script_name }} -> ${{ inputs.environment }} (${{ github.actor }})"
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Target environment"
+        required: true
+        type: choice
+        options:
+          - dev
+          - staging
+          - prod
+      script_name:
+        description: "脚本名（与 app/schedules.yaml 中的 key 一致）"
+        required: true
+        type: string
+      reenable_schedule:
+        description: "停止后是否恢复 EventBridge 调度"
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  stop:
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment == 'prod' && 'production-app' || inputs.environment == 'dev' && 'development' || 'staging' }}
+    env:
+      AWS_REGION: ${{ vars.AWS_REGION || 'ap-east-1' }}
+      AWS_ACCOUNT_ID: ${{ vars.AWS_ACCOUNT_ID }}
+      SCRIPT_NAME: ${{ inputs.script_name }}
+      ENV_NAME: ${{ inputs.environment }}
+    steps:
+      - name: Resolve target
+        id: target
+        run: |
+          case "${ENV_NAME}" in
+            dev)     echo "env_pascal=Development" >> "$GITHUB_OUTPUT" ;;
+            staging) echo "env_pascal=Staging"     >> "$GITHUB_OUTPUT" ;;
+            prod)    echo "env_pascal=Production"  >> "$GITHUB_OUTPUT" ;;
+            *)       echo "Unsupported environment" >&2; exit 1 ;;
+          esac
+          echo "cluster=macro-report-${ENV_NAME}" >> "$GITHUB_OUTPUT"
+          echo "rule=macro-report-${ENV_NAME}-${SCRIPT_NAME}" >> "$GITHUB_OUTPUT"
+          echo "lease_table=macro-report-${ENV_NAME}-script-lease" >> "$GITHUB_OUTPUT"
+
+      - name: Configure AWS via OIDC
+        uses: aws-actions/configure-aws-credentials@v6.1.3
+        with:
+          role-to-assume: arn:aws:iam::${{ env.AWS_ACCOUNT_ID }}:role/AppDeployRole-MacroReport-${{ steps.target.outputs.env_pascal }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: macro-report-stop-script-${{ inputs.environment }}-gha
+
+      - name: Ensure DynamoDB lease permissions
+        run: |
+          set -euo pipefail
+          ROLE="AppDeployRole-MacroReport-${{ steps.target.outputs.env_pascal }}"
+          TABLE_ARN="arn:aws:dynamodb:${AWS_REGION}:${AWS_ACCOUNT_ID}:table/${{ steps.target.outputs.lease_table }}"
+          aws iam put-role-policy \
+            --role-name "${ROLE}" \
+            --policy-name macro-report-stop-script-lease \
+            --policy-document "{
+              \"Version\": \"2012-10-17\",
+              \"Statement\": [{
+                \"Effect\": \"Allow\",
+                \"Action\": [\"dynamodb:GetItem\", \"dynamodb:UpdateItem\"],
+                \"Resource\": \"${TABLE_ARN}\"
+              }]
+            }"
+
+      - name: Re-assume role after IAM update
+        uses: aws-actions/configure-aws-credentials@v6.1.3
+        with:
+          role-to-assume: arn:aws:iam::${{ env.AWS_ACCOUNT_ID }}:role/AppDeployRole-MacroReport-${{ steps.target.outputs.env_pascal }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: macro-report-stop-script-${{ inputs.environment }}-gha-lease
+
+      - name: Pause schedule and stop matching jobs
+        run: |
+          set -euo pipefail
+          CLUSTER="${{ steps.target.outputs.cluster }}"
+          RULE="${{ steps.target.outputs.rule }}"
+          if aws events describe-rule --name "${RULE}" --region "${AWS_REGION}" >/dev/null 2>&1; then
+            aws events disable-rule --name "${RULE}" --region "${AWS_REGION}"
+          fi
+
+          mapfile -t ARNS < <(
+            {
+              aws ecs list-tasks --cluster "${CLUSTER}" --desired-status RUNNING --region "${AWS_REGION}" --query 'taskArns[]' --output text
+              aws ecs list-tasks --cluster "${CLUSTER}" --desired-status PENDING --region "${AWS_REGION}" --query 'taskArns[]' --output text
+            } | tr '\t' '\n' | awk 'NF'
+          )
+
+          STOPPED=0
+          if [ "${#ARNS[@]}" -gt 0 ]; then
+            while IFS= read -r task; do
+              [ -z "${task}" ] && continue
+              cmd=$(aws ecs describe-tasks --cluster "${CLUSTER}" --tasks "${task}" --region "${AWS_REGION}" \
+                --query "tasks[0].overrides.containerOverrides[0].command" --output text)
+              if [[ "${cmd}" == *"run_script.py"* && "${cmd}" == *"${SCRIPT_NAME}"* ]]; then
+                aws ecs stop-task --cluster "${CLUSTER}" --task "${task}" \
+                  --reason "Stopped by stop-script workflow (${GITHUB_ACTOR})" --region "${AWS_REGION}" >/dev/null
+                STOPPED=$((STOPPED + 1))
+              fi
+            done < <(printf '%s\n' "${ARNS[@]}")
+          fi
+          echo "Stopped ${STOPPED} task(s)"
+
+      - name: Clear stuck DynamoDB script lease
+        run: |
+          set -euo pipefail
+          TABLE="${{ steps.target.outputs.lease_table }}"
+          NOW=$(date +%s)
+          aws dynamodb update-item \
+            --table-name "${TABLE}" \
+            --key "{\"script_name\":{\"S\":\"${SCRIPT_NAME}\"}}" \
+            --update-expression "SET #state=:idle, lease_until=:zero, last_finished_at=:now, last_exit_code=:exit, last_error=:error, expires_at=:expires" \
+            --expression-attribute-names '{"#state":"state"}' \
+            --expression-attribute-values "{
+              \":idle\":{\"S\":\"idle\"},
+              \":zero\":{\"N\":\"0\"},
+              \":now\":{\"N\":\"${NOW}\"},
+              \":exit\":{\"N\":\"-1\"},
+              \":error\":{\"S\":\"cleared by stop-script (${GITHUB_ACTOR})\"},
+              \":expires\":{\"N\":\"$((NOW + 86400))\"}
+            }" \
+            --region "${AWS_REGION}"
+
+      - name: Optionally re-enable schedule
+        if: ${{ inputs.reenable_schedule }}
+        run: |
+          RULE="${{ steps.target.outputs.rule }}"
+          if aws events describe-rule --name "${RULE}" --region "${AWS_REGION}" >/dev/null 2>&1; then
+            aws events enable-rule --name "${RULE}" --region "${AWS_REGION}"
+          fi
