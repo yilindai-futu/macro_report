@@ -3,13 +3,15 @@ Lambda: 每天 UTC 14:00 拉取 FRED 宏观数据序列，快照存 S3。
 
 环境变量:
   FRED_API_KEY  - FRED API 密钥（https://fred.stlouisfed.org/docs/api/api_key.html）
-  S3_BUCKET     - 存储桶名称，例如 macro-report-dev-data
+  S3_BUCKET     - 存储桶名称，例如 macro-report-dev-data（为空则写本地文件）
+  LOCAL_DATA_DIR - 本地 fallback 目录（默认 ./data/fred_snapshots）
 """
 import json
 import logging
 import os
 import time
 from datetime import date, datetime, timezone
+from pathlib import Path
 from typing import Any
 
 import boto3
@@ -20,26 +22,83 @@ logger.setLevel(logging.INFO)
 
 FRED_BASE = "https://api.stlouisfed.org/fred/series/observations"
 FRED_API_KEY = os.environ["FRED_API_KEY"]
-S3_BUCKET = os.environ["S3_BUCKET"]
+S3_BUCKET = os.environ.get("S3_BUCKET", "")
+LOCAL_DATA_DIR = Path(os.environ.get("LOCAL_DATA_DIR", "./data/fred_snapshots"))
 
 # (series_id, 中文名, 频率, 拉取期数)
 SERIES: list[tuple[str, str, str, int]] = [
-    ("FEDFUNDS", "联邦基金利率",         "monthly",   24),
-    ("CPIAUCSL", "CPI全项",             "monthly",   24),
-    ("PCEPILFE", "核心PCE物价指数",      "monthly",   24),
-    ("T10YIE",   "10年TIPS通胀预期",     "daily",     90),
-    ("GDPC1",    "实际GDP季调年化",      "quarterly", 12),
-    ("MANEMP",   "制造业就业",           "monthly",   24),
-    ("JTSJOL",   "JOLTS职位空缺",        "monthly",   24),
-    ("UNRATE",   "失业率",              "monthly",   24),
-    ("PAYEMS",   "非农就业NFP",          "monthly",   24),
-    ("ISRATIO",  "零售库存销售比",        "monthly",   24),
-    ("T10Y2Y",   "10年-2年利差",         "daily",     90),
-    ("T10YFF",   "10年-联邦基金利率利差", "daily",     90),
-    ("VIXCLS",   "VIX收盘价",           "daily",     90),
+    # 第一大类：增长类指标
+    ("GDPC1",         "实际GDP季调年化",              "quarterly", 12),
+    ("GDPNOW",        "亚特兰大联储GDPNow预测",       "daily",     90),
+    ("MANEMP",        "制造业就业",                   "monthly",   24),
+    #("NAPMNOI",       "ISM制造业新订单指数",           "monthly",   24),
+    #("NAPMII",        "ISM制造业库存指数",             "monthly",   24),
+    ("INDPRO",        "工业生产指数",                  "monthly",   24),
+    ("TCU",           "产能利用率",                    "monthly",   24),
+    ("RSAFS",         "零售销售（除食品服务）",         "monthly",   24),
+    ("DGORDER",       "耐用品订单",                   "monthly",   24),
+
+    # 第二大类：通胀类指标
+    ("CPIAUCSL",      "CPI全项",                     "monthly",   24),
+    ("CPILFESL",      "核心CPI（剔除食品能源）",       "monthly",   24),
+    ("PCEPILFE",      "核心PCE物价指数",              "monthly",   24),
+    ("T5YIE",         "5年盈亏平衡通胀率",            "daily",     90),
+    ("PPIACO",        "PPI生产者价格指数",            "monthly",   24),
+    ("CES0500000003", "平均时薪（私人非农）",          "monthly",   24),
+
+    # 第三大类：就业类指标
+    ("PAYEMS",        "非农就业NFP",                  "monthly",   24),
+    ("UNRATE",        "失业率",                       "monthly",   24),
+    ("SAHMREALTIME",  "Sahm Rule实时衰退指标",        "monthly",   24),
+    ("ICSA",          "初请失业金人数",                "weekly",    52),
+    ("CCSA",          "持续领取失业金人数",            "weekly",    52),
+    ("JTSJOL",        "JOLTS职位空缺",               "monthly",   24),
+    ("JTSQUR",        "JOLTS离职率",                  "monthly",   24),
+    ("CIVPART",       "劳动参与率",                   "monthly",   24),
+
+    # 第四大类：货币政策与利率指标
+    ("FEDFUNDS",      "联邦基金利率",                 "monthly",   24),
+    ("DGS10",         "10年期国债收益率",              "daily",     90),
+    ("T10Y2Y",        "10年-2年利差",                 "daily",     90),
+    ("DFII10",        "10年实际利率（TIPS）",          "daily",     90),
+    ("M2SL",          "M2货币供应量",                 "monthly",   24),
+    ("WALCL",         "美联储资产负债表总资产",        "weekly",    52),
+
+    # 第五大类：信用与金融压力指标
+    ("BAMLC0A0CM",    "投资级信用利差（IG OAS）",      "daily",     90),
+    ("BAMLH0A0HYM2",  "高收益信用利差（HY OAS）",      "daily",     90),
+    ("DCPF3M",        "3个月商业票据利率",             "daily",     90),
+    ("STLFSI4",       "圣路易斯联储金融压力指数",      "weekly",    52),
+
+    # 第六大类：市场信号与情绪指标
+    ("VIXCLS",        "VIX收盘价",                    "daily",     90),
+
+    # 第七大类：库存与投资周期指标
+    ("ISRATIO",       "库存销售比",                   "monthly",   24),
+    ("HOUST",         "新屋开工",                     "monthly",   24),
+    ("PERMIT",        "营建许可",                     "monthly",   24),
+    ("NEWORDER",      "制造业新订单",                  "monthly",   24),
+
+    # 第八大类：全球与外部冲击指标
+    ("DTWEXBGS",      "贸易加权美元指数",              "daily",     90),
 ]
 
-s3 = boto3.client("s3")
+s3 = boto3.client("s3") if S3_BUCKET else None
+
+
+def _save(snapshot_date: str, series_id: str, payload: dict) -> str:
+    """写入 S3 或本地文件，返回存储路径描述。"""
+    body = json.dumps(payload, ensure_ascii=False, indent=2)
+    key = f"fred/snapshots/{snapshot_date}/{series_id}.json"
+
+    if S3_BUCKET and s3:
+        s3.put_object(Bucket=S3_BUCKET, Key=key, Body=body, ContentType="application/json")
+        return f"s3://{S3_BUCKET}/{key}"
+
+    local_path = LOCAL_DATA_DIR / snapshot_date / f"{series_id}.json"
+    local_path.parent.mkdir(parents=True, exist_ok=True)
+    local_path.write_text(body, encoding="utf-8")
+    return str(local_path)
 
 
 def _fetch_with_retry(series_id: str, limit: int, max_retries: int = 3) -> dict[str, Any]:
@@ -102,15 +161,8 @@ def handler(event: dict, context: Any) -> dict:
                 "observations": observations,
             }
 
-            s3_key = f"fred/snapshots/{snapshot_date}/{series_id}.json"
-            s3.put_object(
-                Bucket=S3_BUCKET,
-                Key=s3_key,
-                Body=json.dumps(payload, ensure_ascii=False, indent=2),
-                ContentType="application/json",
-            )
-
-            logger.info(f"OK {series_id}: {len(observations)} obs → s3://{S3_BUCKET}/{s3_key}")
+            dest = _save(snapshot_date, series_id, payload)
+            logger.info(f"OK {series_id}: {len(observations)} obs → {dest}")
             success.append(series_id)
 
         except Exception as e:
