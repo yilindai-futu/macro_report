@@ -8,7 +8,8 @@ SHARED_DATA_DIR = str(Path(__file__).resolve().parents[3] / "data" / "fred_snaps
 
 os.environ["FRED_API_KEY"] = "a9a70fc1cbe4dcc8cdafe9b070f347cc"
 os.environ["LOCAL_DATA_DIR"] = SHARED_DATA_DIR
-# S3_BUCKET 不设 → handler 自动走本地文件 fallback
+os.environ["S3_BUCKET"] = "meerkat-research-docs-dev-ap-east-1"
+os.environ["AWS_PROFILE"] = "balance-dev-debug"
 
 from handler import handler, SERIES, _fetch_with_retry, _parse_observations
 

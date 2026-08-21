@@ -9,12 +9,12 @@ from botocore.exceptions import ClientError
 
 from config import settings
 
-PREFIX = "fred/snapshots/"
+PREFIX = "tmp/fred/snapshots/"
 LOCAL_DATA_DIR = Path(settings.local_data_dir)
 
 
 def _use_local() -> bool:
-    return not settings.fred_s3_bucket or settings.fred_s3_bucket == "local"
+    return not settings.s3_bucket or settings.s3_bucket == "local"
 
 
 @lru_cache(maxsize=1)
@@ -31,12 +31,19 @@ def list_snapshot_dates() -> list[str]:
     if _use_local():
         if not LOCAL_DATA_DIR.exists():
             return []
-        return sorted(d.name for d in LOCAL_DATA_DIR.iterdir() if d.is_dir())
+        for f in LOCAL_DATA_DIR.glob("*.json"):
+            try:
+                data = json.loads(f.read_text(encoding="utf-8"))
+                if d := data.get("snapshot_date"):
+                    return [d]
+            except Exception:
+                continue
+        return []
 
     paginator = _s3().get_paginator("list_objects_v2")
     dates: set[str] = set()
     for page in paginator.paginate(
-        Bucket=settings.fred_s3_bucket, Prefix=PREFIX, Delimiter="/"
+        Bucket=settings.s3_bucket, Prefix=PREFIX, Delimiter="/"
     ):
         for cp in page.get("CommonPrefixes", []):
             date_part = cp["Prefix"].removeprefix(PREFIX).rstrip("/")
@@ -47,14 +54,14 @@ def list_snapshot_dates() -> list[str]:
 
 def get_series_snapshot(snapshot_date: str, series_id: str) -> dict | None:
     if _use_local():
-        path = LOCAL_DATA_DIR / snapshot_date / f"{series_id}.json"
+        path = LOCAL_DATA_DIR / f"{series_id}.json"
         if not path.exists():
             return None
         return json.loads(path.read_text(encoding="utf-8"))
 
     key = f"{PREFIX}{snapshot_date}/{series_id}.json"
     try:
-        obj = _s3().get_object(Bucket=settings.fred_s3_bucket, Key=key)
+        obj = _s3().get_object(Bucket=settings.s3_bucket, Key=key)
         return json.loads(obj["Body"].read())
     except ClientError as e:
         if e.response["Error"]["Code"] in ("NoSuchKey", "404"):

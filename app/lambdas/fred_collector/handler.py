@@ -82,20 +82,20 @@ SERIES: list[tuple[str, str, str, int]] = [
     # 第八大类：全球与外部冲击指标
     ("DTWEXBGS",      "贸易加权美元指数",              "daily",     90),
 ]
-
+SERIES = SERIES[:3]
 s3 = boto3.client("s3") if S3_BUCKET else None
 
 
 def _save(snapshot_date: str, series_id: str, payload: dict) -> str:
     """写入 S3 或本地文件，返回存储路径描述。"""
     body = json.dumps(payload, ensure_ascii=False, indent=2)
-    key = f"fred/snapshots/{snapshot_date}/{series_id}.json"
-
+    key = f"tmp/fred/snapshots/{snapshot_date}/{series_id}.json"
     if S3_BUCKET and s3:
         s3.put_object(Bucket=S3_BUCKET, Key=key, Body=body, ContentType="application/json")
         return f"s3://{S3_BUCKET}/{key}"
-
-    local_path = LOCAL_DATA_DIR / snapshot_date / f"{series_id}.json"
+    else:
+        raise Exception(f"AWS - S3 failed: S3_BUCKET={S3_BUCKET},s3={s3}")
+    local_path = LOCAL_DATA_DIR / f"{series_id}.json"
     local_path.parent.mkdir(parents=True, exist_ok=True)
     local_path.write_text(body, encoding="utf-8")
     return str(local_path)

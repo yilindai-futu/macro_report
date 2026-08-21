@@ -5,7 +5,7 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
     env: str
-    fred_s3_bucket: str
+    s3_bucket: str
     aws_region: str = "ap-east-1"
     aws_profile: str = ""
     local_data_dir: str = "./data/fred_snapshots"
