@@ -10,6 +10,7 @@ $env:FRED_API_KEY = "a9a70fc1cbe4dcc8cdafe9b070f347cc"
 echo $env:FRED_API_KEY
 
 uv run python run_script.py macro
+
 uv run python main.py 
 
 # Login
